@@ -1,0 +1,391 @@
+---
+title: 'PIC for E10.5 Nuclear speckles'
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    df_print: paged
+    toc: yes
+  pdf_document:
+    keep_tex: yes
+    latex_engine: lualatex
+---
+
+### Setup
+
+```{r libraries,message=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+library(ggrepel)
+library(ggsci)
+library(biomaRt)
+library(readr)
+library(tibble)
+library(pheatmap)
+library(viridis)
+library(uwot)
+library(DESeq2)
+library(msigdbr)
+library(fgsea)
+library(tsne)
+library(umap)
+library(heatmap3)
+
+source("/Users/Oki/icloud/R-studio/geomNorm.R")
+
+# Helper functions
+ggpoints <- function(x,...) 
+  ggplot(x,...) + geom_point(size=3,stroke=1) +
+  ggrepel::geom_text_repel(size=4) + theme_minimal() + mycolor
+## no label and readnumber visualizaton
+#  ggplot(x,...) + geom_point() +theme_minimal() + mycolor
+print(sessionInfo(),locale=FALSE)
+
+select <- dplyr::select
+```
+
+### Parameters
+
+*modify here*
+
+```{r params}
+# Files
+projName <- "Hippo_PIC"
+outDir <- "/Users/Oki/icloud/R-studio/2021.04.26_Hippo_PIC/Rstudio/"
+
+deftable <- paste(outDir, "deftable_", projName, ".tsv", sep="")
+
+## Data selection (filter rows of deftable)
+#use <- quo(!grepl("^18",group) & (group != "Nc-minusTryd"))
+#use <- quo(TRUE) # use all
+#use <- quo(grepl("^x",group) & (group != "^x5"))
+use <- quo(grepl("[^.]",group))
+# Species specific parameters
+species <- "Mus musculus"
+biomartann <- "mmusculus_gene_ensembl" # hsapiens, rnorvegicus, mmusculus
+maxchrom <- 19 # 19: mouse, 22: human, 20: rat
+# Graphics
+# aesthetic mapping of labels
+#myaes <- aes(colour=iris,shape=UV,label=replicate) 
+myaes <- aes(colour=iris,label=replicate) 
+# color palette of points: See vignette("ggsci")
+#mycolor <- ggsci::scale_color_aaas()
+mycolor <- ggsci::scale_color_d3("category20") # color palette of points
+# PCA/UMAP
+scalerows <- TRUE # gene-wise scaling (pattern is the matter?)
+ntop <- 500 # number of top-n genes with high variance
+seed <- 123 # set another number if UMAP looks not good
+n_nei <- 5 # number of neighboring data points in UMAP
+# DESeq2
+#model <- ~leg + enzyme + leg:enzyme
+model <- ~group
+fdr <- 0.1 # acceptable false discovery rate
+lfcthreth <- log2(1) # threshold in abs(log2FC)
+# controls should be placed in the right
+contrast <- list( 
+  #Intercept = list("Intercept"), # reference level
+  #leg_LvsR = c("leg", "L", "R"),
+  #enz_KvsC = c("enzyme","K","C"),
+  #legL.enzK = list("legL.enzymeK") # interaction
+  CA1_vs_CA3 = c("group","CA1","CA3"),
+  CA1_vs_DG = c("group","CA1","DG"),
+  CA3_vs_DG = c("group","CA3","DG")
+  #irisX100_MvsV = c("group","x100M","x100V")
+  #iris_X100MvsX100 = c("iris","x100M","x100"),
+  #size_X100vsX5 = c("iris","x100","x5")
+)
+```
+
+
+
+
+### Retrieve Biomart
+
+```{r biomart, cache=TRUE}
+#if(!exists("e2g")){
+  db <- biomaRt::useMart("ensembl")
+  mart <- biomaRt::useDataset(biomartann,db)
+  e2g <- biomaRt::getBM(attributes=c("ensembl_gene_id","external_gene_name",
+        "gene_biotype","chromosome_name"), mart=mart) %>% as_tibble
+#}
+
+colnames(e2g) <- c("ens_gene", "ext_gene", "biotype", "chr")
+annotate <- partial(right_join,e2g,by="ens_gene")
+```
+
+### Load counts
+
+```{r loadUMI}
+def <- readr::read_tsv(deftable) %>% filter(!!use)
+
+# Set reference levels according to the contrast
+for(x in keep(contrast,is.character))
+  def[[x[1]]] <- relevel(factor(def[[x[1]]]),x[3])
+umi <- def$file %>% unique %>% tibble(file=.) %>% 
+  mutate(data=map(file,readr::read_tsv,progress=FALSE)) %>%
+  unnest()
+colnames(umi)[3] <- "barcode"
+umi <- umi %>%
+  inner_join(select(def,file,barcode,sample),.,c("file","barcode")) %>%
+  select(-file,-barcode)
+colnames(umi)[2] <- "ens_gene"
+mat <- transform(ens_gene=umi$ens_gene, ext_gene=umi$ens_gene, biotype=umi$ens_gene, chr=umi$ens_gene, sample=umi$sample, umi) %>% spread(sample,count,fill=0)   # mat オブジェクトが UMI カウントデータ
+#for total RNA 
+#a <- readr::read_tsv("/home/guestA/n70275a/kTanaka/0434HiSeq/countFiles/UV-CELseq2R0434.renamedfeatureCounts.txt")
+#mat <- a %>% dplyr::select(-(2:6)) %>% rename(ens_gene=Geneid) %>% inner_join(e2g,.)%>% mutate(chr=factor(chr,c(1:maxchrom,"X","Y","MT"))) %>%
+#filter(!is.na(chr))
+print(def)
+```
+
+### Reads breakdown
+
+#### Total reads ## 不要
+
+```{r totalReads, fig.width=8,fig.height=5}
+bychr <- mat %>% select(-(1:3)) %>%
+  gather("sample","count",-chr) %>%
+  group_by(chr,sample) %>% summarise(total=sum(count)) %>% ungroup
+ggplot(bychr,aes(reorder(sample,plyr::desc(sample)),total/1e6,fill=chr)) +
+  theme_linedraw() + geom_bar(stat="identity") + coord_flip() +
+  xlab("sample") + ylab("million reads") + ggsci::scale_fill_igv() +
+  scale_x_discrete(limits = rev(levels(sample)))
+```
+
+#### Biotype ## 不要
+
+```{r biotype,fig.width=8,fig.height=6}
+bt <- mat %>% select(-c(1,2,4)) %>% group_by(biotype) %>%
+  summarise_all(sum) %>% filter_at(-1,any_vars(. > 1000))
+bt %>% tibble::column_to_rownames("biotype") %>%
+  as.matrix %>% t %>% mosaicplot(las=2,shade=TRUE)
+```
+
+### Correlations
+
+drop rows with all 0 -> +1/2 -> geom.scale -> log -> Pearson's
+
+```{r makemat, fig.width=6,fig.height=6}
+matf <- mat %>% filter(chr!="MT") %>% filter_at(-(1:4),any_vars(. > 0))
+X <- matf %>% select(-(1:4)) %>% as.matrix
+rownames(X) <- matf$ens_gene
+lX <- log(gscale(X+0.5))
+R <- cor(lX); diag(R) <- NA
+pheatmap::pheatmap(R,color=viridis::viridis(256))
+```
+
+### Dimension reduction
+
+```{r PCA,fig.width=6,fig.height=4}
+# set scale=TRUE if the patterns (not level) is the matter
+p <- prcomp(t(lX[rank(-apply(lX,1,var)) <= ntop,]),scale=scalerows,center=TRUE)
+screeplot(p,las=2,main="Importance")
+print(summary(p)$imp[,seq(min(10,ncol(X)))])
+```
+
+```{r makescoreDF}
+label <- def %>% filter(sample %in% colnames(X))
+df <- data.frame(p$x) %>% as_tibble(rownames="sample") %>%
+  inner_join(label,.) %>% select(-file)
+```
+
+```{r proximity,fig.width=6,fig.height=5}
+ggpoints(df,modifyList(aes(PC1,PC2),myaes))
+ggpoints(df,modifyList(aes(PC2,PC3),myaes))
+set.seed(seed)
+um <- uwot::umap(p$x,n_nei,2)
+df <- as_tibble(um)
+colnames(df) <- c("UMAP1", "UMAP2")
+df <- bind_cols(df)
+# ggpoints(df,modifyList(aes(UMAP1,UMAP2),myaes))
+```
+
+### DESeq2
+
+#### Fit model
+
+```{r deseq2}
+dds <- DESeq2::DESeqDataSetFromMatrix(X[,label$sample],label,model)
+dds <- DESeq2::DESeq(dds)
+```
+
+#### Diagnostics plot
+
+```{r diagnostics,fig.width=6,fig.height=5}
+DESeq2::sizeFactors(dds) %>%
+  {tibble(sample=names(.),sizeFactor=.)} %>%
+  ggplot(aes(sample,sizeFactor)) + theme_minimal() +
+  geom_bar(stat="identity") + coord_flip()
+
+DESeq2::plotDispEsts(dds)
+```
+
+#### Extract results
+
+```{r extractRes}
+res <- mapply(function(x)
+  DESeq2::results(dds,x,lfcThreshold=lfcthreth,alpha=fdr)
+,contrast)
+re <- map(res,as_tibble,rownames="ens_gene") %>%
+  tibble(aspect=factor(names(.),names(.)),data=.) %>%
+  mutate(data=map(data,annotate)) %>%
+  unnest() %>% filter(padj<fdr)
+fc <- re %>% select(1:7) %>% spread(aspect,log2FoldChange,fill=0)
+p_adj <- re %>% select(c(1:6,11)) %>% spread(aspect,padj,fill=0)
+imap(res,~{
+  cat(paste0("-- ",.y," --"))
+  DESeq2::summary.DESeqResults(.x)
+}) %>% invisible
+```
+
+### GSEA ## 不要
+
+```{r GSEA, warning=FALSE}
+msig <- msigdbr::msigdbr(species)
+fgsea_msig <- partial(fgsea::fgsea,with(msig,split(gene_symbol,gs_name)))
+gscat <- msig %>% select(gs_name,gs_cat,gs_subcat) %>%
+  distinct()
+colnames(gscat)[1] <- "pathway"
+gsea <- re %>% filter(aspect!="Intercept") %>% group_by(aspect) %>%
+  summarise(l2fc=list(setNames(log2FoldChange,ext_gene))) %>%
+  mutate(gse=map(l2fc,fgsea_msig,nperm=10000,maxSize=500)) %>%
+  select(-l2fc) %>% unnest %>% arrange(-NES) %>% right_join(gscat,.) %>%
+  mutate(leadingEdge=map_chr(leadingEdge,paste,collapse=","))
+```
+
+### GSEA ## 不要
+
+```{r Hallmark, fig.width=8, fig.height=6}
+hallmark <- gsea %>% filter(gs_cat=="H") %>%
+  mutate(pathway=sub("^HALLMARK_","",pathway)) %>% 
+  group_by(aspect) %>% nest %>%
+  mutate(plt=map2(data,aspect,~
+    ggplot(.x,aes(reorder(pathway,NES),NES,fill=padj<0.1)) +
+    ggtitle(.y) + xlab("Hallmark gene sets") +
+    geom_bar(stat="identity") + theme_minimal() + coord_flip() +
+    theme(legend.position = "none") + ggsci::scale_fill_aaas())
+  )
+print(hallmark$plt)
+```
+
+See MSigDB Collections: <http://software.broadinstitute.org/gsea/msigdb/collections.jsp>
+
+### Write-out tables
+
+```{r writeout}
+if(exists("fc"))   readr::write_csv(fc, paste(outDir, "l2fc_", projName, ".csv", sep=""))
+if(exists("p_adj"))   readr::write_csv(p_adj, paste(outDir, "padj_", projName, ".csv", sep=""))
+if(exists("re"))   readr::write_csv(re, paste(outDir, "results_", projName, ".csv", sep=""))
+if(exists("gsea")) readr::write_csv(gsea, paste(outDir, "gsea_", projName, ".csv", sep=""))
+if(exists("mat")) readr::write_csv(mat, paste(outDir, "UMI_count_", projName, ".csv", sep=""))
+
+##to get DEseq2 normalized count
+cnt <- DESeq2::counts(dds,normalized=TRUE) %>% as_tibble(rownames="ens_gene") %>% dplyr::left_join(e2g[, (1:2)], by = "ens_gene")
+cnt <- cnt[, c(1, length(cnt), 2:(length(cnt)-1))]
+readr::write_csv(cnt, paste(outDir, "normalizedCountTable_", projName, ".csv", sep=""))
+```
+
+### DEG のみの normalized count データを作成 ## 不要
+```{r deg_normalized, fig.width=8, fig.height=5}
+deg_cnt <- dplyr::left_join(fc, cnt, by = "ens_gene")[, c(2, length(fc)+3:length(cnt)-1)]
+deg_genes <- deg_cnt[, 1] %>% t
+deg_cnt <- deg_cnt[, 2:length(deg_cnt)]
+rownames(deg_cnt) <- deg_genes
+deg_cnt2 <- transform(t(deg_cnt), group=def$group)
+
+heatmap(t(deg_cnt), scale = "column")
+
+readr::write_csv(deg_cnt, paste(outDir, "deg_", projName, ".csv", sep=""))
+write.csv(deg_cnt, paste(outDir, "deg_", projName, ".csv", sep=""))
+```
+### Normalized count でクラスター
+```{r cluster_normalized, fig.width=6, fig.height=6}
+matf2 <- cnt %>% filter_at(-(1:4),any_vars(. > 0))
+X2 <- matf2 %>% select(-(1:2)) %>% as.matrix
+rownames(X2) <- matf2$ens_gene
+lX2 <- log(gscale(X2+0.5))
+R2 <- cor(lX2); diag(R2) <- NA
+pheatmap::pheatmap(R2,color=viridis::viridis(256))
+```
+
+### Normalized count で PCA
+```{r pca_normalized, fig.width=6, fig.height=2}
+p2 <- prcomp(t(lX2[rank(-apply(lX2,1,var)) <= ntop,]),scale=scalerows,center=TRUE)
+screeplot(p2,las=2,main="Importance")
+
+print(summary(p2)$imp[,seq(min(10,ncol(X2)))])
+
+label2 <- def %>% filter(sample %in% colnames(X2))
+df2 <- data.frame(p2$x) %>% as_tibble(rownames="sample") %>%
+  inner_join(label,.) %>% select(-file)
+
+ggpoints(df2,modifyList(aes(PC1,PC2),myaes))
+ggpoints(df2,modifyList(aes(PC2,PC3),myaes))
+```
+
+### Regularized log を DeSeq で PCA
+```{r deseq_pca, fig.width=4, fig.height=2}
+
+rld <- rlog(dds)
+ppca <- plotPCA(rld, "group")
+ppca
+```
+### DEG の regularized log の heatmap
+```{r deseq_heat, fig.width=6, fig.height=3}
+rld_df <- assay(rld) %>% as.data.frame()
+rld_df <- cbind(rld_df, rownames(rld_df))
+colnames(rld_df)[ncol(rld_df)] <- "ens_gene"
+deg_rld <- dplyr::left_join(fc, rld_df, by = "ens_gene")[, (ncol(fc)+1) : (ncol(rld_df)+ncol(fc)-1)] %>% as.matrix
+rownames(deg_rld) <- fc$ens_gene
+hm3 <- heatmap3(t(deg_rld), scale = "column", Rowv = NA, margins=c(10,0))
+heatMatrix <- cbind(rev(rownames(t(deg_rld))), t(deg_rld)[rev(hm3$rowInd),hm3$colInd]) %>% as.data.frame()
+readr::write_csv(heatMatrix, paste(outDir, "heatMap_", projName, ".csv", sep=""))
+```
+### Regularized log を prcomp で PCA
+```{r prcomp_pca, fig.width=6, fig.height=3}
+lX3 <- assay(rld) %>% as.data.frame()
+p3 <- prcomp(t(lX3[rank(-apply(lX3,1,var)) <= ntop,]),scale=scalerows,center=TRUE)
+screeplot(p3,las=2,main="Importance")
+print(summary(p3)$imp[,seq(min(10,ncol(X2)))])
+df3 <- data.frame(p3$x) %>% as_tibble(rownames="sample") %>%
+  inner_join(label,.) %>% select(-file)
+ggpoints(df3,modifyList(aes(PC1,PC2),myaes))
+ggpoints(df3,modifyList(aes(PC2,PC3),myaes))
+ggpoints(df3,modifyList(aes(PC2,PC4),myaes))
+ggpoints(df3,modifyList(aes(PC3,PC4),myaes))
+```
+
+### Regularized log を tsne で tSNE
+```{r tsne, fig.width=6, fig.height=2}
+lX3.tsne <- tsne(t(lX3[rank(-apply(lX3,1,var)) <= ntop,]), max_iter=1000, perplexity = 3000)
+df4 <- cbind(data.frame(lX3.tsne), df3)[, c(5,6,1,2)]
+ggpoints(df4,modifyList(aes(X1,X2),myaes))
+```
+
+### Regularized log を umap で UMAP
+```{r umap, fig.width=6, fig.height=2}
+lX3.umap <- umap(t(lX3[rank(-apply(lX3,1,var)) <= ntop,]), pca = 10)
+df5 <- cbind(data.frame(lX3.umap$layout), df3)[, c(5,6,1,2)]
+if(exists("df5")) readr::write_csv(df5, paste(outDir, "UMAP_", projName, ".csv", sep=""))
+ggpoints(df5,modifyList(aes(X1,X2),myaes))
+```
+
+### DEG の regularized log の k-means
+```{r k-means, fig.width=6, fig.height=5}
+lX4 <- transform(lX3, ens_gene=rownames(lX3))
+lX4 <- dplyr::left_join(fc, lX4, by = "ens_gene")[, c(1, length(fc)+2:length(lX4)-1)]
+
+K <- 30
+km4 <- array(0, dim = c(K, dim(lX4)))
+
+for (k in 1:K) {
+km <- kmeans(lX4[, 2:length(lX4)] %>% as.matrix(), k, iter.max = 100)
+  km2 <- transform(lX4, cluster=km$cluster)
+  km3 <- km2[order(km2$cluster),][, 1:length(lX4)+1] %>% as.matrix()
+  km4[k,,] <- km3
+  rownames(km3) <- sub("1", "=", sub("0", "  =", km3[, ncol(km3)] %% 2))
+  heatmap(km3[, 1:ncol(km3)-1], Colv = NA, Rowv = NA, scale = "row", main = k)
+}
+```
