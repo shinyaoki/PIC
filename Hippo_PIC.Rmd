@@ -141,28 +141,6 @@ print(def)
 ```
 
 ### Reads breakdown
-
-#### Total reads ## 不要
-
-```{r totalReads, fig.width=8,fig.height=5}
-bychr <- mat %>% select(-(1:3)) %>%
-  gather("sample","count",-chr) %>%
-  group_by(chr,sample) %>% summarise(total=sum(count)) %>% ungroup
-ggplot(bychr,aes(reorder(sample,plyr::desc(sample)),total/1e6,fill=chr)) +
-  theme_linedraw() + geom_bar(stat="identity") + coord_flip() +
-  xlab("sample") + ylab("million reads") + ggsci::scale_fill_igv() +
-  scale_x_discrete(limits = rev(levels(sample)))
-```
-
-#### Biotype ## 不要
-
-```{r biotype,fig.width=8,fig.height=6}
-bt <- mat %>% select(-c(1,2,4)) %>% group_by(biotype) %>%
-  summarise_all(sum) %>% filter_at(-1,any_vars(. > 1000))
-bt %>% tibble::column_to_rownames("biotype") %>%
-  as.matrix %>% t %>% mosaicplot(las=2,shade=TRUE)
-```
-
 ### Correlations
 
 drop rows with all 0 -> +1/2 -> geom.scale -> log -> Pearson's
@@ -240,38 +218,6 @@ imap(res,~{
 }) %>% invisible
 ```
 
-### GSEA ## 不要
-
-```{r GSEA, warning=FALSE}
-msig <- msigdbr::msigdbr(species)
-fgsea_msig <- partial(fgsea::fgsea,with(msig,split(gene_symbol,gs_name)))
-gscat <- msig %>% select(gs_name,gs_cat,gs_subcat) %>%
-  distinct()
-colnames(gscat)[1] <- "pathway"
-gsea <- re %>% filter(aspect!="Intercept") %>% group_by(aspect) %>%
-  summarise(l2fc=list(setNames(log2FoldChange,ext_gene))) %>%
-  mutate(gse=map(l2fc,fgsea_msig,nperm=10000,maxSize=500)) %>%
-  select(-l2fc) %>% unnest %>% arrange(-NES) %>% right_join(gscat,.) %>%
-  mutate(leadingEdge=map_chr(leadingEdge,paste,collapse=","))
-```
-
-### GSEA ## 不要
-
-```{r Hallmark, fig.width=8, fig.height=6}
-hallmark <- gsea %>% filter(gs_cat=="H") %>%
-  mutate(pathway=sub("^HALLMARK_","",pathway)) %>% 
-  group_by(aspect) %>% nest %>%
-  mutate(plt=map2(data,aspect,~
-    ggplot(.x,aes(reorder(pathway,NES),NES,fill=padj<0.1)) +
-    ggtitle(.y) + xlab("Hallmark gene sets") +
-    geom_bar(stat="identity") + theme_minimal() + coord_flip() +
-    theme(legend.position = "none") + ggsci::scale_fill_aaas())
-  )
-print(hallmark$plt)
-```
-
-See MSigDB Collections: <http://software.broadinstitute.org/gsea/msigdb/collections.jsp>
-
 ### Write-out tables
 
 ```{r writeout}
@@ -287,19 +233,6 @@ cnt <- cnt[, c(1, length(cnt), 2:(length(cnt)-1))]
 readr::write_csv(cnt, paste(outDir, "normalizedCountTable_", projName, ".csv", sep=""))
 ```
 
-### DEG のみの normalized count データを作成 ## 不要
-```{r deg_normalized, fig.width=8, fig.height=5}
-deg_cnt <- dplyr::left_join(fc, cnt, by = "ens_gene")[, c(2, length(fc)+3:length(cnt)-1)]
-deg_genes <- deg_cnt[, 1] %>% t
-deg_cnt <- deg_cnt[, 2:length(deg_cnt)]
-rownames(deg_cnt) <- deg_genes
-deg_cnt2 <- transform(t(deg_cnt), group=def$group)
-
-heatmap(t(deg_cnt), scale = "column")
-
-readr::write_csv(deg_cnt, paste(outDir, "deg_", projName, ".csv", sep=""))
-write.csv(deg_cnt, paste(outDir, "deg_", projName, ".csv", sep=""))
-```
 ### Normalized count でクラスター
 ```{r cluster_normalized, fig.width=6, fig.height=6}
 matf2 <- cnt %>% filter_at(-(1:4),any_vars(. > 0))
@@ -355,37 +288,4 @@ ggpoints(df3,modifyList(aes(PC1,PC2),myaes))
 ggpoints(df3,modifyList(aes(PC2,PC3),myaes))
 ggpoints(df3,modifyList(aes(PC2,PC4),myaes))
 ggpoints(df3,modifyList(aes(PC3,PC4),myaes))
-```
-
-### Regularized log を tsne で tSNE
-```{r tsne, fig.width=6, fig.height=2}
-lX3.tsne <- tsne(t(lX3[rank(-apply(lX3,1,var)) <= ntop,]), max_iter=1000, perplexity = 3000)
-df4 <- cbind(data.frame(lX3.tsne), df3)[, c(5,6,1,2)]
-ggpoints(df4,modifyList(aes(X1,X2),myaes))
-```
-
-### Regularized log を umap で UMAP
-```{r umap, fig.width=6, fig.height=2}
-lX3.umap <- umap(t(lX3[rank(-apply(lX3,1,var)) <= ntop,]), pca = 10)
-df5 <- cbind(data.frame(lX3.umap$layout), df3)[, c(5,6,1,2)]
-if(exists("df5")) readr::write_csv(df5, paste(outDir, "UMAP_", projName, ".csv", sep=""))
-ggpoints(df5,modifyList(aes(X1,X2),myaes))
-```
-
-### DEG の regularized log の k-means
-```{r k-means, fig.width=6, fig.height=5}
-lX4 <- transform(lX3, ens_gene=rownames(lX3))
-lX4 <- dplyr::left_join(fc, lX4, by = "ens_gene")[, c(1, length(fc)+2:length(lX4)-1)]
-
-K <- 30
-km4 <- array(0, dim = c(K, dim(lX4)))
-
-for (k in 1:K) {
-km <- kmeans(lX4[, 2:length(lX4)] %>% as.matrix(), k, iter.max = 100)
-  km2 <- transform(lX4, cluster=km$cluster)
-  km3 <- km2[order(km2$cluster),][, 1:length(lX4)+1] %>% as.matrix()
-  km4[k,,] <- km3
-  rownames(km3) <- sub("1", "=", sub("0", "  =", km3[, ncol(km3)] %% 2))
-  heatmap(km3[, 1:ncol(km3)-1], Colv = NA, Rowv = NA, scale = "row", main = k)
-}
 ```
